@@ -168,18 +168,35 @@ get_sysadmin_id() {
 #===============================================================================
 
 load_telegram_config() {
+#    if [ ! -f "$TELEGRAM_CONFIG" ]; then
+#        warning_message "Archivo de configuración de Telegram no encontrado"
+#        return 1
+#    fi
+#    
+#    source "$TELEGRAM_CONFIG"
+#    
+#    if [ -z "$BOT_TOKEN" ]; then
+#        warning_message "Token del bot no configurado"
+#        return 1
+#    fi
+#   return 0
+ # 1) El archivo debe existir
     if [ ! -f "$TELEGRAM_CONFIG" ]; then
         warning_message "Archivo de configuración de Telegram no encontrado"
         return 1
     fi
-    
-    source "$TELEGRAM_CONFIG"
-    
+
+    # 2) Extraemos el token sin sourcear el resto
+    BOT_TOKEN=$(grep '^BOT_TOKEN=' "$TELEGRAM_CONFIG" \
+                   | head -1 \
+                   | cut -d'=' -f2- \
+                   | tr -d '"')
+
     if [ -z "$BOT_TOKEN" ]; then
         warning_message "Token del bot no configurado"
-        return 1
+       return 1
     fi
-    
+
     return 0
 }
 
@@ -194,7 +211,7 @@ send_telegram_notification() {
     fi
     
     # Obtener chat_id del sysadmin
-    local chat_id=$(grep "^$sysadmin_id:" "$TELEGRAM_CONFIG" | cut -d':' -f2)
+    local chat_id=$(grep "^$sysadmin_id:" "$TELEGRAM_CONFIG" | tail -1 | cut -d':' -f2)
     
     if [ -z "$chat_id" ]; then
         warning_message "Chat ID no encontrado para sysadmin: $sysadmin_id"
@@ -223,69 +240,93 @@ send_telegram_notification() {
     fi
 }
 
+# --- tu-script-principal.sh: función wait_for_password mejorada
+
 wait_for_password() {
     local sysadmin_id="$1"
-    local timeout=300 # 5 minutos
+    local chat_id response u uid cid txt
     local start_time=$(date +%s)
-    
-    if ! load_telegram_config; then
-        return 1
+    local timeout=300   # segundos máximos
+    local last_id=0
+
+    # 1) Determinar el chat_id esperado
+    chat_id=$(grep "^$sysadmin_id:" "$TELEGRAM_CONFIG" | tail -n1 | cut -d: -f2)
+
+    # 2) Purge inicial: descartamos backlog y obtenemos el mayor update_id
+    response=$(curl -s \
+      "https://api.telegram.org/bot$BOT_TOKEN/getUpdates?offset=0&limit=100&timeout=0")
+    if echo "$response" | jq -e '.ok' >/dev/null 2>&1; then
+        last_id=$(echo "$response" | jq '[.result[].update_id] | max // 0')
     fi
-    
-    local chat_id=$(grep "^$sysadmin_id:" "$TELEGRAM_CONFIG" | cut -d':' -f2)
-    local url="https://api.telegram.org/bot$BOT_TOKEN/getUpdates"
-    local last_update_id=0
-    
-    info_message "Esperando contraseña del sysadmin $sysadmin_id..."
-    
-    while [ $(($(date +%s) - start_time)) -lt $timeout ]; do
-        local response=$(curl -s "$url?offset=$((last_update_id + 1))")
-        
-        if echo "$response" | grep -q '"ok":true'; then
-            local updates=$(echo "$response" | grep -o '"result":\[.*\]' | sed 's/"result":\[//' | sed 's/\]$//')
-            
-            if [ ! -z "$updates" ] && [ "$updates" != "null" ]; then
-                while IFS= read -r update; do
-                    if [ ! -z "$update" ]; then
-                        local update_chat_id=$(echo "$update" | grep -o '"chat":{"id":[^,]*' | grep -o '[0-9-]*$')
-                        local message_text=$(echo "$update" | grep -o '"text":"[^"]*"' | sed 's/"text":"//' | sed 's/"$//')
-                        local update_id=$(echo "$update" | grep -o '"update_id":[0-9]*' | grep -o '[0-9]*$')
-                        
-                        if [ "$update_chat_id" = "$chat_id" ] && [ ! -z "$message_text" ]; then
-                            echo "$message_text"
-                            return 0
-                        fi
-                        
-                        if [ ! -z "$update_id" ] && [ "$update_id" -gt "$last_update_id" ]; then
-                            last_update_id=$update_id
-                        fi
-                    fi
-                done <<< "$(echo "$updates" | sed 's/},{/\n/g')"
+
+    echo "ℹ Esperando nueva contraseña de $sysadmin_id..." >&2
+
+    # 3) Loop de polling: offset dinámico que esquiva mensajes viejos
+    while [ $(( $(date +%s) - start_time )) -lt $timeout ]; do
+        response=$(curl -s \
+          "https://api.telegram.org/bot$BOT_TOKEN/getUpdates?offset=$((last_id+1))&limit=1&timeout=0")
+
+        # Validar JSON y extraer el primer update
+        if echo "$response" | jq -e '.ok' >/dev/null 2>&1; then
+            u=$(echo "$response" | jq -c '.result[0]?')
+            if [ -n "$u" ]; then
+                uid=$(echo "$u" | jq -r '.update_id')
+                cid=$(echo "$u" | jq -r '.message.chat.id')
+                txt=$(echo "$u" | jq -r '.message.text' 2>/dev/null | tr -d '\r\n')
+
+                # Marcamos este update para no repetirlo
+                last_id=$uid
+
+                # Si es del chat correcto, devolvemos txt y salimos
+                if [ "$cid" = "$chat_id" ] && [ -n "$txt" ]; then
+                    echo -n "$txt"
+                    return 0
+                fi
             fi
         fi
-        
-        sleep 2
+
+        # No hay mensaje nuevo: esperar 5 s
+        sleep 5
     done
-    
-    warning_message "Timeout esperando contraseña"
+
+    warning_message "⚠ Timeout esperando contraseña"
     return 1
 }
 
+
+
+
 verify_server_password() {
     local provided_password="$1"
-    
+    # 1) Limpiar retornos de carro y saltos, luego recortar espacios al inicio y final
+    provided_password=$(printf "%s" "$provided_password" \
+                         | tr -d '\r\n' \
+                         | xargs)
+
+    # 2) Leer y limpiar el hash almacenado
     if [ ! -f "$SERVER_HASH" ]; then
         error_exit "Archivo de hash del servidor no encontrado"
     fi
-    
-    local stored_hash=$(cat "$SERVER_HASH")
-    local provided_hash=$(echo -n "$provided_password" | sha256sum | cut -d' ' -f1)
-    
+    local stored_hash
+    stored_hash=$(tr -d ' \r\n' < "$SERVER_HASH")
+
+    # 3) Calcular hash de la contraseña proporcionada
+    local provided_hash
+    provided_hash=$(printf "%s" "$provided_password" \
+                    | sha256sum \
+                    | cut -d' ' -f1)
+
+    # 4) Debug solo en stderr
+    echo "DEBUG: hash almacenado: $stored_hash" >&2
+    echo "DEBUG: hash recibido   : $provided_hash" >&2
+    echo "DEBUG: contraseña limpia: '$provided_password'" >&2
+
+    # 5) Comparación
     if [ "$stored_hash" = "$provided_hash" ]; then
-        success_message "Contraseña del servidor verificada"
+        success_message "Contraseña verificada"
         return 0
     else
-        warning_message "Contraseña del servidor incorrecta"
+        warning_message "Contraseña incorrecta"
         return 1
     fi
 }
@@ -356,15 +397,17 @@ process_usb_backup() {
     info_message "Procesando dispositivo USB: $usb_device"
     
     # Encontrar punto de montaje
-    for mount_point in "$USB_MOUNT_BASE"/*; do
-        if mountpoint -q "$mount_point" 2>/dev/null; then
-            local mounted_device=$(df "$mount_point" | tail -1 | awk '{print $1}')
-            if [[ "$mounted_device" == *"$usb_device"* ]]; then
-                usb_path="$mount_point"
-                break
-            fi
-        fi
-    done
+#    for mount_point in "$USB_MOUNT_BASE"/*; do
+#        if mountpoint -q "$mount_point" 2>/dev/null; then
+#            local mounted_device=$(df "$mount_point" | tail -1 | awk '{print $1}')
+#            if [[ "$mounted_device" == *"$usb_device"* ]]; then
+#                usb_path="$mount_point"
+#                break
+#            fi
+#        fi
+#    done
+    # Encontrar punto de montaje usando findmnt
+    usb_path=$(findmnt -n -o TARGET "/dev/$usb_device" 2>/dev/null || echo "")
     
     if [ -z "$usb_path" ]; then
         warning_message "No se pudo encontrar el punto de montaje para $usb_device"
@@ -382,27 +425,51 @@ process_usb_backup() {
     # Obtener ID del sysadmin
     local sysadmin_id=$(get_sysadmin_id "$usb_path")
     info_message "Sysadmin identificado: $sysadmin_id"
-    
+    trap 'err=$?; \
+          send_telegram_notification "$sysadmin_id" \
+            "❌ Error durante el proceso de respaldo (código $err). Revise logs en el servidor." \
+            "false"; \
+          return $err' ERR
+          
     # Enviar notificación de inicio y solicitar contraseña
     send_telegram_notification "$sysadmin_id" \
         "🔄 Iniciando proceso de respaldo en servidor $(hostname). Por favor, proporcione la contraseña del servidor." \
         "true"
     
     # Esperar contraseña del servidor
-    local server_password=$(wait_for_password "$sysadmin_id")
-    
-    if [ -z "$server_password" ]; then
-        send_telegram_notification "$sysadmin_id" \
-            "❌ Respaldo cancelado: No se recibió la contraseña del servidor en el tiempo límite."
-        return 1
-    fi
-    
-    # Verificar contraseña del servidor
-    if ! verify_server_password "$server_password"; then
-        send_telegram_notification "$sysadmin_id" \
-            "❌ Respaldo cancelado: Contraseña del servidor incorrecta."
-        return 1
-    fi
+   # ─── Inicio bucle de intentos ───
+    local server_password
+    local max_attempts=5
+    for attempt in $(seq 1 $max_attempts); do
+        # Esperar contraseña
+        server_password=$(wait_for_password "$sysadmin_id")
+        if [ -z "$server_password" ]; then
+            # No respondió a tiempo: cancelamos
+            send_telegram_notification "$sysadmin_id" \
+                "❌ Respaldo cancelado: No se recibió la contraseña en el tiempo límite."
+            return 1
+        fi
+
+        # Verificar contraseña
+        if verify_server_password "$server_password"; then
+            # OK, salimos del bucle y continuamos
+            break
+        else
+            # Falló el intento: notificar y reintentar (solicitamos de nuevo)
+            send_telegram_notification "$sysadmin_id" \
+                "❌ Contraseña incorrecta. Vuelva a introducir la contraseña (Intento: $attempt/$max_attempts)." \
+                "true"
+            # Si fue el último intento, cancelamos
+            if [ "$attempt" -eq "$max_attempts" ]; then
+                send_telegram_notification "$sysadmin_id" \
+                    "❌ Respaldo cancelado: Se alcanzaron $max_attempts intentos incorrectos."
+                return 1
+            fi
+            # Volvemos a iterar al siguiente attempt
+        fi
+    done
+    # ─── Fin bucle de intentos ───
+
     
     # Leer configuración de respaldo
     read_backup_config "$usb_path"
@@ -434,7 +501,7 @@ monitor_usb() {
             info_message "Nuevo dispositivo USB detectado: $device"
             
             # Esperar un momento para que el dispositivo se monte
-            sleep 3
+            sleep 5
             
             # Procesar el respaldo
             process_usb_backup "$device"
@@ -589,66 +656,6 @@ EOF
 }
 
 #===============================================================================
-# FUNCIÓN PRINCIPAL
-#===============================================================================
-
-main() {
-    # Verificar que se ejecute como root
-    if [ "$EUID" -ne 0 ]; then
-        error_exit "Este script debe ejecutarse como root"
-    fi
-    
-    case "${1:-}" in
-        --monitor)
-            check_dependencies
-            create_directories
-            monitor_usb
-            ;;
-        --process-usb)
-            if [ -z "$2" ]; then
-                error_exit "Debe especificar el dispositivo USB"
-            fi
-            check_dependencies
-            create_directories
-            process_usb_direct "$2"
-            ;;
-        --install)
-            check_dependencies
-            setup_initial_config
-            install_service
-            ;;
-        --setup)
-            check_dependencies
-            setup_initial_config
-            ;;
-        --add-key)
-            if [ -z "$2" ]; then
-                error_exit "Debe especificar el archivo de llave pública"
-            fi
-            add_sysadmin_key "$2"
-            ;;
-        --set-password)
-            if [ -z "$2" ]; then
-                error_exit "Debe especificar la contraseña"
-            fi
-            set_server_password "$2"
-            ;;
-        --status)
-            show_status
-            ;;
-        --help|"")
-            show_help
-            ;;
-        *)
-            error_exit "Opción no válida: $1. Use --help para ver las opciones disponibles."
-            ;;
-    esac
-}
-
-# Ejecutar función principal con todos los argumentos
-main "$@"
-
-#===============================================================================
 # FUNCIÓN MEJORADA DE PROCESAMIENTO USB
 #===============================================================================
 
@@ -711,3 +718,65 @@ process_usb_direct() {
     
     info_message "Procesamiento de USB completado"
 }
+
+
+#===============================================================================
+# FUNCIÓN PRINCIPAL
+#===============================================================================
+
+main() {
+    # Verificar que se ejecute como root
+    if [ "$EUID" -ne 0 ]; then
+        error_exit "Este script debe ejecutarse como root"
+    fi
+    
+    case "${1:-}" in
+        --monitor)
+            check_dependencies
+            create_directories
+            monitor_usb
+            ;;
+        --process-usb)
+            if [ -z "$2" ]; then
+                error_exit "Debe especificar el dispositivo USB"
+            fi
+            check_dependencies
+            create_directories
+            process_usb_direct "$2"
+            ;;
+        --install)
+            check_dependencies
+            setup_initial_config
+            install_service
+            ;;
+        --setup)
+            check_dependencies
+            setup_initial_config
+            ;;
+        --add-key)
+            if [ -z "$2" ]; then
+                error_exit "Debe especificar el archivo de llave pública"
+            fi
+            add_sysadmin_key "$2"
+            ;;
+        --set-password)
+            if [ -z "$2" ]; then
+                error_exit "Debe especificar la contraseña"
+            fi
+            set_server_password "$2"
+            ;;
+        --status)
+            show_status
+            ;;
+        --help|"")
+            show_help
+            ;;
+        *)
+            error_exit "Opción no válida: $1. Use --help para ver las opciones disponibles."
+            ;;
+    esac
+}
+
+# Ejecutar función principal con todos los argumentos
+main "$@"
+
