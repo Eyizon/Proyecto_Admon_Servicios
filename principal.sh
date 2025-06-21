@@ -357,7 +357,7 @@ create_backup() {
     local usb_path="$2"
     local server_password="$3"
     local timestamp=$(date '+%Y%m%d_%H%M%S')
-    
+    local sysadmin_id=$(get_sysadmin_id "$usb_path")
     info_message "Iniciando proceso de respaldo..."
     
     for dir in $backup_dirs; do
@@ -380,6 +380,8 @@ create_backup() {
             success_message "Respaldo completado: $backup_filename ($size)"
         else
             warning_message "Error al crear respaldo de: $dir"
+            send_telegram_notification "$sysadmin_id" \
+                "❌ Respaldo cancelado: Error al crear respaldo por favor verifique integridad de dispositivo"
         fi
     done
     
