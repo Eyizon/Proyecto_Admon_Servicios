@@ -16,9 +16,10 @@ StandardOutput=journal
 StandardError=journal
 
 # Configuración de seguridad
-NoNewPrivileges=yes
-PrivateTmp=yes
-ProtectSystem=strict
+#NoNewPrivileges=yes
+#PrivateTmp=yes
+ProtectSystem=full
+ReadOnlyPaths=/usr/local/bin
 ReadWritePaths=/etc/backup-system /var/log/backup-system /tmp/backup-system /media
 
 # Variables de entorno
